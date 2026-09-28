@@ -250,3 +250,66 @@ def test_only_the_turn_root_span_is_marked_as_root(
     # Children explicitly opt out of the SDK's app-root auto-marking, so the
     # events view never lists them as root observations.
     assert all(o._otel_span.attributes.get("langfuse.internal.is_app_root") is False for o in children)
+
+
+def test_background_bash_turn_ships_at_its_stop_when_notification_is_absorbed_mid_turn(
+    hook_module,
+    fake_langfuse,
+    isolated_hook_state,
+    tmp_path,
+):
+    """Claude Code 2.1.281 enqueues a background Bash completion, attaches it
+    to the running turn and removes it with reason absorbed_mid_turn."""
+    notification = (
+        "<task-notification>\n<task-id>b0hs0t91w</task-id>\n"
+        "<tool-use-id>toolu_bg1</tool-use-id>\n"
+        "<output-file>/tmp/tasks/b0hs0t91w.output</output-file>\n"
+        "<status>completed</status>\n"
+        "<summary>Background command \"curl\" completed (exit code 0)</summary>\n"
+        "</task-notification>"
+    )
+    rows = [
+        {"type": "user", "uuid": "user-1", "timestamp": "2026-01-01T00:00:00.000Z",
+         "sessionId": "s", "message": {"role": "user", "content": "Trigger the request and debug it."}},
+        {"type": "assistant", "uuid": "a-1", "timestamp": "2026-01-01T00:00:01.000Z",
+         "message": {"id": "msg-1", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "tool_use", "id": "toolu_bg1", "name": "Bash",
+                                  "input": {"command": "curl -s https://example.test/",
+                                            "run_in_background": True}}]}},
+        {"type": "user", "uuid": "tr-1", "timestamp": "2026-01-01T00:00:02.000Z",
+         "toolUseResult": {"stdout": "", "stderr": "", "interrupted": False,
+                           "backgroundTaskId": "b0hs0t91w"},
+         "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_bg1",
+                     "content": "Command running in background with ID: b0hs0t91w."}]}},
+        {"type": "assistant", "uuid": "a-2", "timestamp": "2026-01-01T00:00:03.000Z",
+         "message": {"id": "msg-2", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "tool_use", "id": "toolu_wait", "name": "mcp__debug__wait",
+                                  "input": {}}]}},
+        {"type": "queue-operation", "operation": "enqueue",
+         "timestamp": "2026-01-01T00:00:04.000Z", "content": notification},
+        {"type": "user", "uuid": "tr-2", "timestamp": "2026-01-01T00:00:05.000Z",
+         "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_wait",
+                     "content": "exited"}]}},
+        {"type": "attachment", "uuid": "att-1", "timestamp": "2026-01-01T00:00:04.000Z",
+         "attachment": {"type": "queued_command", "prompt": notification,
+                        "commandMode": "task-notification"}},
+        {"type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn",
+         "timestamp": "2026-01-01T00:00:05.500Z", "content": notification},
+        {"type": "assistant", "uuid": "a-3", "timestamp": "2026-01-01T00:00:06.000Z",
+         "message": {"id": "msg-3", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "text", "text": "Request finished; breakpoint hit."}]}},
+    ]
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+
+    def roots():
+        return [o for o in fake_langfuse.observations if o.name == "Conversational Turn"]
+
+    # The only Stop must export the final output. There may be no next prompt
+    # or usable SessionEnd to close this turn.
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-bg", transcript)
+    assert len(roots()) == 1
+    assert roots()[0].output == {"role": "assistant", "content": "Request finished; breakpoint hit."}
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-bg", transcript)
+    assert len(roots()) == 1
